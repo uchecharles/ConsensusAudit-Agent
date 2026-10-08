@@ -10,7 +10,7 @@ import {
 
 const AVAILABLE_EXTENSIONS = ['.sol', '.ts', '.tsx', '.js', '.py', '.rs', '.go', '.html', '.json'];
 const EXPLORER_TX = 'https://explorer-studio-dev.genlayer.com//transactions';
-const CONTRACT_ADDRESS = '0xC00e25A34Ce346fDb4E3F3582e637154D9f85588';
+const CONTRACT_ADDRESS = '0x4E50b22a93F1359eb663170fC334810487f7eEC7';
 const CONTRACT_ADDRESS_SHORT = `${CONTRACT_ADDRESS.slice(0, 6)}...${CONTRACT_ADDRESS.slice(-6)}`;
 
 const formatTimestamp = (value: any): string => {

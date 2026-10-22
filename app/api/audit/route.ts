@@ -3,28 +3,19 @@ import { NextResponse } from 'next/server';
 import { Groq } from 'groq-sdk';
 import { checkRateLimit } from '@/lib/rate-limit';
 import { normalizeVerdict, type Verdict } from '@/lib/verdict';
-import {
-  getGenLayerClient,
-  ensureConsensus,
-  withFees,
-  newSubmissionId,
-  GENLAYER_CONTRACT_ADDRESS,
-  NO_VALUE
-} from '@/lib/genlayer';
+import { getGenLayerClient, newSubmissionId, GENLAYER_CONTRACT_ADDRESS } from '@/lib/genlayer';
+import { resolveBundle, type AuditRequest } from '@/lib/audit-input';
+import { IngestError } from '@/lib/github-pin';
+import { verifyAuth, submissionIdFor, type AuthFields } from '@/lib/audit-auth';
+import { relayAudit } from '@/lib/onchain-audit';
+import { MAX_REBUTTAL_CHARS_ONCHAIN, type Bundle } from '@/lib/binding';
 
 export const maxDuration = 90;
 export const runtime = 'nodejs';
 
-// Ceiling for whatever gets ingested (a single file, a PR diff, or the
-// concatenation of up to 3 GitHub files). Matches the contract's own
-// MAX_CODE_CHARS so nothing server-side is more permissive than what the
-// chain will actually store.
-const OVERALL_MAX_CODE_CHARS = 60000;
-
-// The off-chain Groq path has no such constraint — it gets the full ingested
-// code, up to this ceiling (bounded mainly by model context, not protocol time).
+// The off-chain Groq path has no on-chain constraint — it gets the reviewed payload,
+// up to this ceiling (bounded mainly by model context, not protocol time).
 const MAX_CODE_CHARS_OFFCHAIN = 20000;
-
 const MAX_REBUTTAL_CHARS = 1000;
 
 async function generateAttestationHash(payload: any): Promise<{ hash: string; signed: boolean }> {
@@ -54,7 +45,7 @@ async function generateAttestationHash(payload: any): Promise<{ hash: string; si
   };
 }
 
-function buildPrompt(code: string, rebuttal?: string, maxCodeChars: number = OVERALL_MAX_CODE_CHARS) {
+function buildPrompt(code: string, rebuttal?: string, maxCodeChars: number = MAX_CODE_CHARS_OFFCHAIN) {
   const truncated = code.length > maxCodeChars;
   const header =
 `You are an independent decentralized validator node in a security consensus network.
@@ -84,112 +75,35 @@ RULE: if critical_count > 0 or high_count > 0 then status MUST be "REJECTED".`;
   return header + codeBlock + rebuttalBlock;
 }
 
+function bindingFields(b: Bundle) {
+  return {
+    repoUrl: b.repoUrl,
+    commitSha: b.commitSha,
+    contentHash: b.contentHash,
+    scopeHash: b.scopeHash,
+    reviewTruncated: b.truncated
+  };
+}
+
+type AuditBody = AuditRequest & {
+  wallet?: string;
+  signature?: string;
+  nonce?: string;
+  issuedAt?: number;
+  expiresAt?: number;
+};
+
 export async function POST(req: Request) {
   try {
     const ip = req.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'unknown';
     const rl = await checkRateLimit(ip);
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: `Rate limit exceeded. Try again in ${rl.retryAfterSeconds}s.` },
-        { status: 429 }
-      );
+      return NextResponse.json({ error: `Rate limit exceeded. Try again in ${rl.retryAfterSeconds}s.` }, { status: 429 });
     }
 
-    const { url, code, allowedExtensions, rebuttal, submissionId: priorSubmissionId } = await req.json();
-    let contractCode = code;
-
-    const defaultExtensions = ['.sol', '.ts', '.html', '.js', '.py'];
-    const activeExtensions: string[] = Array.isArray(allowedExtensions) && allowedExtensions.length > 0
-      ? allowedExtensions.map((ext: string) => ext.trim().startsWith('.') ? ext.trim().toLowerCase() : `.${ext.trim().toLowerCase()}`)
-      : defaultExtensions;
-
-    const fetchOptions: RequestInit = { signal: AbortSignal.timeout(10000) };
-    const githubApiHeaders: HeadersInit = process.env.GITHUB_TOKEN
-      ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
-      : {};
-
-    if (url) {
-      if (!/^https:\/\/github\.com\//.test(url)) {
-        return NextResponse.json({ error: 'Only https://github.com/ URLs are supported.' }, { status: 400 });
-      }
-
-      if (url.includes('/pull/')) {
-        const fetchUrl = url.endsWith('.diff') || url.endsWith('.patch') ? url : `${url}.diff`;
-        const response = await fetch(fetchUrl, fetchOptions);
-        if (!response.ok) {
-          return NextResponse.json({
-            error: `GitHub rejected the PR fetch (status ${response.status}). The PR may be private or deleted, or the URL is malformed. Try the base repository link instead.`
-          }, { status: 400 });
-        }
-        contractCode = await response.text();
-      }
-      else if (url.includes('/blob/')) {
-        const fetchUrl = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
-        const response = await fetch(fetchUrl, fetchOptions);
-        if (!response.ok) {
-          return NextResponse.json({ error: 'Could not fetch that file from GitHub.' }, { status: 400 });
-        }
-        contractCode = await response.text();
-      }
-      else {
-        const match = url.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-        if (!match) return NextResponse.json({ error: 'Invalid GitHub repository URL.' }, { status: 400 });
-
-        const owner = match[1];
-        const repo = match[2].replace(/\/$/, '').replace(/\.git$/, '');
-
-        let treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/main?recursive=1`, { ...fetchOptions, headers: githubApiHeaders });
-        let branch = 'main';
-        if (!treeRes.ok) {
-          treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/master?recursive=1`, { ...fetchOptions, headers: githubApiHeaders });
-          branch = 'master';
-        }
-
-        if (!treeRes.ok) return NextResponse.json({ error: 'Could not read that repository. Make sure it is public.' }, { status: 400 });
-
-        const treeData = await treeRes.json();
-
-        const scoreFile = (path: string) => {
-          let score = 0;
-          const lowerPath = path.toLowerCase();
-          if (lowerPath.endsWith('.sol')) score += 10;
-          if (lowerPath.includes('contract')) score += 8;
-          if (lowerPath.includes('core')) score += 5;
-          if (lowerPath.includes('interface')) score += 5;
-          if (lowerPath.includes('main')) score += 3;
-          if (lowerPath.includes('test') || lowerPath.includes('mock')) score -= 10;
-          return score;
-        };
-
-        const filesToFetch = treeData.tree.filter((item: any) =>
-          item.type === 'blob' &&
-          activeExtensions.some((ext: string) => item.path.toLowerCase().endsWith(ext)) &&
-          !item.path.includes('node_modules/') && !item.path.includes('dist/') && !item.path.includes('.next/')
-        ).sort((a: any, b: any) => scoreFile(b.path) - scoreFile(a.path)).slice(0, 3);
-
-        if (filesToFetch.length === 0) {
-          return NextResponse.json({ error: 'No files matched the selected extensions.' }, { status: 400 });
-        }
-
-        contractCode = `--- REPOSITORY ARCHITECTURE FOR ${owner}/${repo} ---\n\n`;
-
-        for (const file of filesToFetch) {
-          const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
-          const fileRes = await fetch(rawUrl, fetchOptions);
-          if (fileRes.ok) {
-            const fullText = await fileRes.text();
-            const truncatedText = fullText.length > 5000 ? fullText.substring(0, 5000) + '\n...[TRUNCATED]' : fullText;
-            contractCode += `\n// FILE: ${file.path}\n${truncatedText}`;
-          }
-        }
-      }
-    }
-
-    if (!contractCode || !String(contractCode).trim()) {
-      return NextResponse.json({ error: 'No code could be processed.' }, { status: 400 });
-    }
-
-    contractCode = String(contractCode).slice(0, OVERALL_MAX_CODE_CHARS);
+    const body = (await req.json()) as AuditBody;
+    const { rebuttal, submissionId: priorSubmissionId } = body;
+    const signed = Boolean(body.signature && body.wallet);
 
     if (rebuttal && !priorSubmissionId) {
       return NextResponse.json(
@@ -198,91 +112,85 @@ export async function POST(req: Request) {
       );
     }
 
-    let finalVerdict: Verdict | null = null;
-    let fallbackReason: string | null = null;
+    // Resolve exactly what will be reviewed (pinned to a commit and hashed).
+    const { bundle } = await resolveBundle(body, { pinToPrior: signed });
+    const contractCode = bundle.payload;
 
-    // ========================================================================
-    // STAGE 1: GENLAYER ON-CHAIN CONSENSUS
-    // ========================================================================
-    const client = getGenLayerClient();
-
-    if (!client) {
-      fallbackReason = 'GENLAYER_PRIVATE_KEY is not configured on the server.';
-    } else {
+    // Verify the wallet signature over THIS content/commit/scope. A request that is not
+    // signed never touches the chain: it is analysed off chain and labelled as such.
+    let verifiedWallet: string | null = null;
+    let onchainId: string | null = null;
+    let authError: string | null = null;
+    if (signed) {
+      const fields: AuthFields = {
+        action: rebuttal ? 'appeal' : 'audit',
+        wallet: String(body.wallet),
+        nonce: String(body.nonce),
+        issuedAt: Number(body.issuedAt),
+        expiresAt: Number(body.expiresAt)
+      };
       try {
-        await ensureConsensus(client);
-
-        const newId = newSubmissionId(rebuttal ? 'appeal' : 'audit');
-        const functionName = rebuttal && priorSubmissionId ? 'file_appeal' : 'submit_audit';
-
-        const onChainCode = contractCode;
-        const onChainTruncated = false;
-
-        const writeArgs = rebuttal && priorSubmissionId
-          ? [priorSubmissionId, newId, onChainCode, String(rebuttal).slice(0, MAX_REBUTTAL_CHARS)]
-          : [newId, onChainCode];
-
-        let exactFees;
-        try {
-          exactFees = await client.estimateTransactionFeesForWrite({
-            address: GENLAYER_CONTRACT_ADDRESS,
-            functionName,
-            args: writeArgs,
-            value: NO_VALUE
-          });
-        } catch (simErr: any) {
-          console.warn('Fee simulation failed, falling back to retry loop:', simErr?.message);
-          exactFees = await withFees(client);
+        if (rebuttal && String(rebuttal).length > MAX_REBUTTAL_CHARS_ONCHAIN) {
+          throw new Error(`Rebuttal is limited to ${MAX_REBUTTAL_CHARS_ONCHAIN} characters.`);
         }
+        verifiedWallet = verifyAuth(fields, String(body.signature), bundle, priorSubmissionId ?? null, rebuttal ? String(rebuttal) : null);
+        onchainId = submissionIdFor(fields.action, fields.nonce);
+      } catch (e: any) {
+        return NextResponse.json({ error: e?.message || 'Signature check failed.' }, { status: 401 });
+      }
+      const wl = await checkRateLimit(`wallet:${verifiedWallet}`);
+      if (!wl.allowed) {
+        return NextResponse.json({ error: `Rate limit for this wallet. Try again in ${wl.retryAfterSeconds}s.` }, { status: 429 });
+      }
+    }
 
-        const txHash = await client.writeContract({
-          address: GENLAYER_CONTRACT_ADDRESS,
-          functionName,
-          args: writeArgs,
-          value: NO_VALUE,
-          ...(exactFees ? { fees: exactFees } : {})
-        });
+    let finalVerdict: Verdict | null = null;
+    let fallbackReason: string | null = signed
+      ? null
+      : 'No wallet signature was provided, so this was analysed off chain only. It is not a GenLayer verdict.';
 
-        // 🚀 FIX: Extended polling timeout parameters to accommodate GenLayer's consensus cycle (~4 mins max)
-        await client.waitForTransactionReceipt({
-          hash: txHash,
-          waitUntil: 'finalized',
-          interval: 5000,
-          retries: 50
-        });
+    // ========================================================================
+    // STAGE 1: GENLAYER ON-CHAIN CONSENSUS (only for a verified wallet signature)
+    // ========================================================================
+    if (signed && verifiedWallet && onchainId) {
+      const client = getGenLayerClient();
+      if (!client) {
+        fallbackReason = 'GENLAYER_PRIVATE_KEY is missing or is not a valid 0x + 64-hex private key in .env.local.';
+      } else {
+        try {
+          const { verdict: onchain, txHash } = await relayAudit(client, {
+            submissionId: onchainId,
+            wallet: verifiedWallet,
+            bundle,
+            priorSubmissionId: rebuttal ? String(priorSubmissionId) : undefined,
+            rebuttal: rebuttal ? String(rebuttal) : undefined
+          });
 
-        const verdictStr = await client.readContract({
-          address: GENLAYER_CONTRACT_ADDRESS,
-          functionName: 'get_verdict',
-          args: [newId]
-        }) as string;
-
-        if (!verdictStr) throw new Error('Contract returned an empty verdict for this submission.');
-
-        const onchain = JSON.parse(verdictStr);
-
-        finalVerdict = {
-          ...normalizeVerdict(onchain),
-          mode: 'genlayer-consensus',
-          contractAddress: GENLAYER_CONTRACT_ADDRESS,
-          submissionId: newId,
-          txHash,
-          timestamp: new Date().toISOString(),
-          isAppeal: Boolean(onchain.is_appeal ?? rebuttal),
-          previousVerdictHash: onchain.previous_id || priorSubmissionId || null,
-          appealDepth: Number(onchain.appeal_depth ?? 0),
-          codeCharsAnalyzed: onChainCode.length,
-          codeCharsTotal: contractCode.length,
-          codeTruncatedOnChain: onChainTruncated
-        };
-      } catch (genlayerError: any) {
-        fallbackReason = `On-chain execution failed: ${genlayerError?.message || genlayerError}`;
-        console.warn(fallbackReason);
+          finalVerdict = {
+            ...normalizeVerdict(onchain),
+            mode: 'genlayer-consensus',
+            contractAddress: GENLAYER_CONTRACT_ADDRESS,
+            submissionId: onchainId,
+            txHash,
+            timestamp: new Date().toISOString(),
+            isAppeal: Boolean(onchain.is_appeal),
+            previousVerdictHash: onchain.previous_id || null,
+            appealDepth: Number(onchain.appeal_depth ?? 0),
+            submitter: onchain.submitter,
+            contentHashVerifiedOnChain: Boolean(onchain.content_hash_verified),
+            ...bindingFields(bundle),
+            codeCharsAnalyzed: bundle.payload.length,
+            codeCharsTotal: bundle.manifest.files.reduce((n, f) => n + f.n, 0)
+          };
+        } catch (genlayerError: any) {
+          fallbackReason = `On-chain execution failed: ${genlayerError?.message || genlayerError}`;
+          console.warn(fallbackReason);
+        }
       }
     }
 
     // ========================================================================
-    // STAGE 2: GROQ MULTI-MODEL CONSENSUS (off-chain fallback)
+    // STAGE 2: OFF-CHAIN ANALYSIS (never labelled as GenLayer consensus)
     // ========================================================================
     if (!finalVerdict) {
       const apiKey = process.env.GROQ_API_KEY;
@@ -379,10 +287,12 @@ export async function POST(req: Request) {
       }
     }
 
+
     if (finalVerdict.mode !== 'genlayer-consensus') {
-      const { hash, signed } = await generateAttestationHash(finalVerdict);
+      Object.assign(finalVerdict, bindingFields(bundle));
+      const { hash, signed: attested } = await generateAttestationHash(finalVerdict);
       finalVerdict.verdictHash = hash;
-      finalVerdict.signed = signed;
+      finalVerdict.signed = attested;
     }
 
     if (fallbackReason) finalVerdict.fallbackReason = fallbackReason;
@@ -390,7 +300,8 @@ export async function POST(req: Request) {
     return NextResponse.json(finalVerdict);
 
   } catch (error: any) {
+    const status = error instanceof IngestError ? error.status : 500;
     console.error('Audit API error:', error?.message || error);
-    return NextResponse.json({ error: error?.message || String(error) }, { status: 500 });
+    return NextResponse.json({ error: error?.message || String(error) }, { status });
   }
 }

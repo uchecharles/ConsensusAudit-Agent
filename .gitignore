@@ -1,0 +1,23 @@
+# dependencies / build
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# secrets: never commit these
+.env
+.env.*
+!.env.example
+account*.json
+decrypt.js
+*.keystore
+*.pem
+
+# python
+__pycache__/
+*.pyc
+
+# os / editor
+.DS_Store
+.vercel

@@ -1,6 +1,6 @@
 // app/api/lookup/route.ts
 import { NextResponse } from 'next/server';
-import { getGenLayerClient, GENLAYER_CONTRACT_ADDRESS } from '@/lib/genlayer';
+import { getReadClient, GENLAYER_CONTRACT_ADDRESS } from '@/lib/genlayer';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -16,8 +16,7 @@ export async function GET(req: Request) {
     const offset = Number(searchParams.get('offset') ?? '0');
     const limit = Number(searchParams.get('limit') ?? '20');
     try {
-      const client = getGenLayerClient();
-      if (!client) return NextResponse.json({ error: 'GenLayer client not configured.' }, { status: 500 });
+      const client = getReadClient();
 
       const ids = await client.readContract({
         address: GENLAYER_CONTRACT_ADDRESS,
@@ -37,8 +36,7 @@ export async function GET(req: Request) {
   }
 
   try {
-    const client = getGenLayerClient();
-    if (!client) return NextResponse.json({ error: 'GenLayer client not configured.' }, { status: 500 });
+    const client = getReadClient();
 
     const raw = await client.readContract({
       address: GENLAYER_CONTRACT_ADDRESS,

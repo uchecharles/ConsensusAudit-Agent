@@ -7,10 +7,12 @@ import {
   Plus, Zap, Layers, Activity, Download, Database, AlertTriangle,
   Lock, Unlock, Send, AlertCircle, Search, Shield, UserCog, Coins
 } from "lucide-react";
+import { connectWallet, currentAccount, signText, walletWrite, onMetaMask } from "@/lib/wallet";
+import { genToWei, weiToGen } from "@/lib/units";
 
 const AVAILABLE_EXTENSIONS = ['.sol', '.ts', '.tsx', '.js', '.py', '.rs', '.go', '.html', '.json'];
-const EXPLORER_TX = 'https://explorer-studio-dev.genlayer.com//transactions';
-const CONTRACT_ADDRESS = '0x4E50b22a93F1359eb663170fC334810487f7eEC7';
+const EXPLORER_TX = 'https://explorer-studio-dev.genlayer.com/transactions';
+const CONTRACT_ADDRESS = '0x2Aa8038ea96051fb4748E538E7665Fe4EB39ef24';
 const CONTRACT_ADDRESS_SHORT = `${CONTRACT_ADDRESS.slice(0, 6)}...${CONTRACT_ADDRESS.slice(-6)}`;
 
 const formatTimestamp = (value: any): string => {
@@ -64,6 +66,9 @@ export default function Home() {
 
   const [contractCode, setContractCode] = useState(`// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ncontract VulnerableVault {\n    mapping(address => uint256) public balances;\n\n    function deposit() external payable {\n        balances[msg.sender] += msg.value;\n    }\n\n    // Vulnerability: Reentrancy\n    function withdraw() external {\n        uint256 balance = balances[msg.sender];\n        require(balance > 0, "No balance");\n\n        (bool success, ) = msg.sender.call{value: balance}("");\n        require(success, "Transfer failed");\n\n        balances[msg.sender] = 0;\n    }\n}`);
 
+  const [wallet, setWallet] = useState<string | null>(null);
+  const [walletError, setWalletError] = useState<string | null>(null);
+
   const [isAuditing, setIsAuditing] = useState(false);
   const [auditStep, setAuditStep] = useState<string>("Ready. Choose a target to audit.");
   const [validatorsActive, setValidatorsActive] = useState(false);
@@ -80,8 +85,9 @@ export default function Home() {
   const [isAppealing, setIsAppealing] = useState(false);
 
   const [adminInfo, setAdminInfo] = useState<{
-    owner: string; paused: boolean; balanceGen?: string; totalSubmissions?: number
+    owner: string; paused: boolean; relayer?: string; balanceGen?: string; totalSubmissions?: number
   } | null>(null);
+  const [relayerInput, setRelayerInput] = useState("");
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminMessage, setAdminMessage] = useState<string | null>(null);
   const [newOwnerInput, setNewOwnerInput] = useState("");
@@ -111,6 +117,52 @@ export default function Home() {
 
   useEffect(() => { refreshAdmin(); }, []);
 
+  useEffect(() => {
+    currentAccount().then(a => { if (a) setWallet(a); });
+    const onAccounts = (accts: string[]) => setWallet(accts?.[0] ?? null);
+    let eth: any = null;
+    onMetaMask().then(p => { eth = p; eth?.on?.('accountsChanged', onAccounts); }).catch(() => {});
+    return () => eth?.removeListener?.('accountsChanged', onAccounts);
+  }, []);
+
+  const handleConnect = async () => {
+    setWalletError(null);
+    try {
+      setWallet(await connectWallet());
+    } catch (e: any) {
+      setWalletError(e?.message || 'Could not connect the wallet.');
+    }
+  };
+
+  const isOwner = Boolean(wallet && adminInfo?.owner && wallet.toLowerCase() === String(adminInfo.owner).toLowerCase());
+
+  // Audit request. With a connected wallet the server first pins the content to a commit and
+  // returns the exact text to sign; the signed request is what authorises the on-chain write.
+  // Without a wallet the audit is analysed off chain only and is never shown as GenLayer consensus.
+  const requestAudit = async (extra: Record<string, any>) => {
+    const base = inputMode === "github" ? { url: repoUrl, allowedExtensions: selectedExtensions } : { code: contractCode };
+    const payload = { ...base, ...extra };
+    const post = async (path: string, body: any) => {
+      const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      return data;
+    };
+    if (!wallet) return post('/api/audit', payload);
+
+    setAuditStep("Pinning the content to an exact commit and hashing it...");
+    const prep = await post('/api/audit/prepare', { ...payload, wallet });
+    addLog(`Bound to commit ${prep.binding.commitSha ? prep.binding.commitSha.slice(0, 7) : '(pasted code)'} · content ${prep.binding.contentHash.slice(0, 10)}...`);
+    if (prep.binding.truncated) addLog("Note: part of the source exceeded the review budget and was truncated. This is recorded in the scope.");
+    setAuditStep("Confirm the request in your wallet...");
+    const signature = await signText(wallet, prep.message);
+    setAuditStep("Broadcasting to the validator committee...");
+    return post('/api/audit', {
+      ...payload, wallet, signature,
+      nonce: prep.fields.nonce, issuedAt: prep.fields.issuedAt, expiresAt: prep.fields.expiresAt
+    });
+  };
+
   const toggleExtension = (ext: string) => {
     setSelectedExtensions(prev => prev.includes(ext) ? prev.filter(e => e !== ext) : [...prev, ext]);
   };
@@ -135,8 +187,8 @@ export default function Home() {
 
   const describeMode = (data: any) => {
     if (data.mode === "genlayer-consensus") return "Consensus finalized on chain.";
-    if (data.mode === "heuristic-fallback") return "Consensus unavailable. Static heuristics only.";
-    return "Consensus finalized off chain, server-attested.";
+    if (data.mode === "heuristic-fallback") return "Static heuristics only. Not a consensus verdict.";
+    return "Off-chain model analysis, server-attested. Not a GenLayer verdict.";
   };
 
   const runConsensusAudit = async () => {
@@ -169,21 +221,7 @@ export default function Home() {
     }
 
     try {
-      const response = await fetch('/api/audit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(
-          inputMode === "github"
-            ? { url: repoUrl, allowedExtensions: selectedExtensions }
-            : { code: contractCode }
-        )
-      });
-
-      setAuditStep("Broadcasting to the validator committee...");
-      addLog("Payload broadcast to validator committee.");
-
-      const data = await response.json();
-      if (data.error) throw new Error(data.error);
+      const data = await requestAudit({});
 
       setExecutionTime(Math.round(performance.now() - startTime));
       setResult(data);
@@ -215,20 +253,7 @@ export default function Home() {
     addLog("Appeal submitted.");
 
     try {
-      const response = await fetch('/api/audit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...(inputMode === "github"
-            ? { url: repoUrl, allowedExtensions: selectedExtensions }
-            : { code: contractCode }),
-          rebuttal,
-          submissionId: result.submissionId || null
-        })
-      });
-
-      const data = await response.json();
-      if (data.error) throw new Error(data.error);
+      const data = await requestAudit({ rebuttal, submissionId: result.submissionId || null });
 
       setResult(data);
       setEscrow(null);
@@ -251,11 +276,34 @@ export default function Home() {
     }
   };
 
+  const readEscrow = async (submissionId: string, txHash: string) => {
+    const res = await fetch(`/api/lookup?submissionId=${encodeURIComponent(submissionId)}&type=escrow`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    if (!data.found) throw new Error('The contract returned no escrow record.');
+    const e = data.data;
+    return {
+      status: e.status, amount: e.amount, amountGen: weiToGen(e.amount ?? '0'),
+      beneficiary: e.beneficiary, depositor: e.depositor, releasedBy: e.released_by,
+      txHash, onchain: true
+    };
+  };
+
+  // Escrow is signed by YOUR wallet. The contract checks gl.message.sender_address, so the
+  // depositor, beneficiary and owner roles are real wallet identities, not a shared server key.
   const callEscrow = async (action: 'create' | 'release' | 'claim' | 'refund') => {
     if (!result) return;
-    if (action === 'create' && result.mode === 'genlayer-consensus') {
-      if (!beneficiaryAddress.trim()) {
-        setEscrowError('Enter a beneficiary address before opening escrow.');
+    if (result.mode !== 'genlayer-consensus') {
+      setEscrowError('Escrow needs an on-chain verdict. Connect your wallet and run the audit again.');
+      return;
+    }
+    if (!wallet) {
+      setEscrowError('Connect your wallet to use escrow.');
+      return;
+    }
+    if (action === 'create') {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(beneficiaryAddress.trim())) {
+        setEscrowError('Enter a valid 0x... beneficiary address before opening escrow.');
         return;
       }
       if (!amountGen.trim() || Number(amountGen) <= 0) {
@@ -266,63 +314,48 @@ export default function Home() {
 
     setEscrowLoading(true);
     setEscrowError(null);
-
     try {
-      const res = await fetch('/api/escrow', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action,
-          verdict: result,
-          amountGen,
-          beneficiary: beneficiaryAddress || undefined
-        })
-      });
-      const data = await res.json();
-
-      if (data.error) {
-        if (data.escrow) setEscrow(data.escrow);
-        throw new Error(data.error);
-      }
-
-      setEscrow(data.escrow);
+      const fn = action === 'create' ? 'open_escrow' : `${action}_escrow`;
+      const args = action === 'create' ? [result.submissionId, beneficiaryAddress.trim()] : [result.submissionId];
+      setAuditStep('Confirm the transaction in your wallet...');
+      const tx = await walletWrite(wallet, fn, args, action === 'create' ? genToWei(amountGen) : undefined);
+      const rec = await readEscrow(result.submissionId, tx.hash);
+      setEscrow(rec);
       addLog(
-        action === 'create' ? `Escrow hold created${data.escrow?.onchain ? ` on chain (${data.escrow.amountGen ?? amountGen} GEN). Tx: ${data.escrow.txHash}` : '.'}`
-        : action === 'release' ? `Escrow released (depositor path). Tx: ${data.escrow.txHash}`
-        : action === 'claim' ? `Escrow claimed (beneficiary path). Tx: ${data.escrow.txHash}`
-        : `Escrow refunded to the depositor. Tx: ${data.escrow.txHash}`
+        action === 'create' ? `Escrow opened on chain (${rec.amountGen} GEN). Tx: ${tx.hash}`
+        : action === 'release' ? `Escrow released by your wallet. Tx: ${tx.hash}`
+        : action === 'claim' ? `Escrow claimed by your wallet (beneficiary). Tx: ${tx.hash}`
+        : `Escrow refunded to the depositor. Tx: ${tx.hash}`
       );
-      if (data.escrow?.onchain) refreshAdmin();
+      refreshAdmin();
     } catch (e: any) {
-      setEscrowError(e.message);
-      addLog(`Escrow: ${e.message}`);
+      setEscrowError(e?.message || String(e));
+      addLog(`Escrow: ${e?.message || e}`);
     } finally {
       setEscrowLoading(false);
     }
   };
 
-  const callAdmin = async (action: 'pause' | 'unpause' | 'transfer_ownership' | 'force_refund') => {
+  // Administration is signed by the connected wallet and enforced by the contract's owner check.
+  const callAdmin = async (action: 'pause' | 'unpause' | 'transfer_ownership' | 'force_refund' | 'set_relayer') => {
+    if (!wallet) { setAdminMessage('Error: connect the owner wallet first.'); return; }
     setAdminLoading(true);
     setAdminMessage(null);
     try {
-      const body: any = { action };
-      if (action === 'transfer_ownership') body.newOwner = newOwnerInput.trim();
-      if (action === 'force_refund') body.submissionId = forceRefundId.trim();
+      const call =
+        action === 'pause' ? { fn: 'set_paused', args: [true] } :
+        action === 'unpause' ? { fn: 'set_paused', args: [false] } :
+        action === 'transfer_ownership' ? { fn: 'transfer_ownership', args: [newOwnerInput.trim()] } :
+        action === 'set_relayer' ? { fn: 'set_relayer', args: [relayerInput.trim()] } :
+        { fn: 'admin_force_refund', args: [forceRefundId.trim()] };
 
-      const res = await fetch('/api/admin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-
-      setAdminMessage(`${action} succeeded. Tx: ${data.txHash}`);
-      addLog(`Admin: ${action} confirmed on chain. Tx: ${data.txHash}`);
+      const tx = await walletWrite(wallet, call.fn, call.args);
+      setAdminMessage(`${action} succeeded. Tx: ${tx.hash}`);
+      addLog(`Admin: ${action} confirmed on chain. Tx: ${tx.hash}`);
       refreshAdmin();
     } catch (e: any) {
-      setAdminMessage(`Error: ${e.message}`);
-      addLog(`Admin error: ${e.message}`);
+      setAdminMessage(`Error: ${e?.message || e}`);
+      addLog(`Admin error: ${e?.message || e}`);
     } finally {
       setAdminLoading(false);
     }
@@ -357,7 +390,8 @@ export default function Home() {
       ? `**On-chain submission ID:** \`${result.submissionId}\` (contract: ${result.contractAddress})\n**Transaction:** [\`${result.txHash}\`](${EXPLORER_TX}/${result.txHash})`
       : `**Submission ID:** \`${result.submissionId}\`\n**Attestation (${result.signed ? 'HMAC-signed' : 'unsigned digest'}):** \`0x${result.verdictHash}\``;
 
-    const reportContent = `# ConsensusAudit — security certificate\n\n**Generated:** ${formatTimestamp(result.timestamp)}\n**Target:** ${targetInfo}\n${attestationLine}\n**Audit mode:** ${result.mode}${result.isAppeal ? `\n**Appeal of:** \`${result.previousVerdictHash}\`` : ''}\n\n## Verdict: ${result.status}\n\n### Metrics\n- Execution latency: ${executionTime ?? 0}ms\n\n### Vulnerability summary\n- Critical: ${result.critical_count}\n- High: ${result.high_count}\n\n## Findings\n\n${(result.findings || []).map((f: any) => `### ${f.type} [${f.severity}]\n${f.summary}\n`).join('\n')}\n\n---\n*ConsensusAudit v2.0*`;
+    const bindingLine = result.contentHash ? `**Reviewed content:** SHA-256 \`${result.contentHash}\`\n**Commit:** ${result.commitSha ? `\`${result.commitSha}\`` : '(pasted code, no commit)'}\n**Scope hash:** \`${result.scopeHash}\`${result.reviewTruncated ? '\n**Note:** part of the source exceeded the review budget and was truncated (recorded in the scope).' : ''}\n${result.mode === 'genlayer-consensus' ? `**Hash recomputed by contract:** ${result.contentHashVerifiedOnChain ? 'yes' : 'no (runner lacks hashlib)'}\n` : ''}` : '';
+    const reportContent = `# ConsensusAudit — security certificate\n\n**Generated:** ${formatTimestamp(result.timestamp)}\n**Target:** ${targetInfo}\n${attestationLine}\n${bindingLine}**Audit mode:** ${result.mode}${result.isAppeal ? `\n**Appeal of:** \`${result.previousVerdictHash}\`` : ''}\n\n## Verdict: ${result.status}\n\n### Metrics\n- Execution latency: ${executionTime ?? 0}ms\n\n### Vulnerability summary\n- Critical: ${result.critical_count}\n- High: ${result.high_count}\n\n## Findings\n\n${(result.findings || []).map((f: any) => `### ${f.type} [${f.severity}]\n${f.summary}\n`).join('\n')}\n\n---\n*ConsensusAudit v2.0*`;
 
     const blob = new Blob([reportContent], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
@@ -401,6 +435,15 @@ export default function Home() {
                 <AlertTriangle className="w-3.5 h-3.5" /> Contract paused
               </div>
             )}
+            <button
+              onClick={handleConnect}
+              title={walletError ?? "Connect the wallet that will sign audits, escrow and admin actions"}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-xl border text-xs font-mono transition ${
+                wallet ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300" : "bg-indigo-600/20 border-indigo-500/40 text-indigo-200 hover:bg-indigo-600/30"
+              }`}
+            >
+              {wallet ? `${wallet.slice(0, 6)}...${wallet.slice(-4)}${isOwner ? " · owner" : ""}` : "Connect wallet"}
+            </button>
             <a
               href={`https://explorer-studio-dev.genlayer.com/address/${CONTRACT_ADDRESS}`}
               target="_blank"
@@ -848,8 +891,8 @@ export default function Home() {
 
                   <p className="text-[10px] text-slate-600 leading-relaxed">
                     {result.mode === 'genlayer-consensus'
-                      ? "Settlement runs through the contract, which checks the caller and the verdict before moving anything. Opening escrow attaches real GEN via gl.message.value. \"Release\" and \"Claim\" call different contract methods (release_escrow / claim_escrow) for depositor vs. beneficiary — both currently execute as the same server-held key, since this app doesn't yet support per-user wallet signing."
-                      : "Settlement checks the verdict's HMAC signature server-side. A forged or edited verdict cannot move funds."}
+                      ? "Escrow transactions are signed by your connected wallet, so the contract sees you as the real depositor, beneficiary or owner. The contract checks the caller and the verdict before moving anything. Opening escrow attaches real GEN via gl.message.value."
+                      : "Escrow is only available for on-chain verdicts. Connect your wallet and run the audit again to get one; off-chain analysis cannot hold or move funds."}
                   </p>
                 </div>
 
@@ -935,6 +978,26 @@ export default function Home() {
               </div>
 
               <div className="space-y-1.5">
+                <label className="text-[10px] text-slate-500">Approved relayer (may submit audits for wallets that signed a request) · current: {adminInfo?.relayer || "none"}</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={relayerInput}
+                    onChange={(e) => setRelayerInput(e.target.value)}
+                    placeholder="Relayer 0x... address (empty clears)"
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl py-2 px-3 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500 transition"
+                  />
+                  <button
+                    onClick={() => callAdmin('set_relayer')}
+                    disabled={adminLoading || !isOwner}
+                    className="px-4 py-2 rounded-xl text-xs font-medium bg-slate-900 border border-slate-800 text-slate-300 hover:border-indigo-500/50 transition disabled:opacity-50"
+                  >
+                    Set relayer
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
                 <label className="text-[10px] text-slate-500">Force-refund a stuck escrow (break-glass)</label>
                 <div className="flex gap-2">
                   <input
@@ -961,7 +1024,7 @@ export default function Home() {
               )}
 
               <p className="text-[10px] text-slate-600 leading-relaxed">
-                These calls only succeed if the server's signing key is the contract owner. Since this app relays every transaction with one server-held key, they will succeed as long as that key deployed the contract — the contract's own check is real, but there's currently only one address in the system to check against.
+                These actions are signed by your connected wallet. The contract rejects them unless that wallet is the owner, and no server key can perform them.
               </p>
             </div>
           </div>
